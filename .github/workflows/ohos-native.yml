@@ -1,0 +1,261 @@
+# Native HarmonyOS build of qtbase.
+#
+# Runs the OpenHarmony userland container (hqzing/dockerharmony, plus the
+# OpenHarmony SDK clang and Qt's third-party dependencies) on a native arm64
+# runner and builds qtbase inside it.
+#
+# This is the native case, not a cross build: no toolchain file and no
+# CMAKE_SYSTEM_NAME. -DOHOS=ON has to be passed by hand because uname inside a
+# container is answered by the host kernel and says Linux, so Qt's native
+# detection in QtAutoDetectHelpers.cmake can never fire here. A real device
+# takes the other branch.
+#
+# A native arm64 runner is not just a speed choice. Under a kernel without
+# CONFIG_ANON_VMA_NAME, OHOS musl's heap-VMA naming prctl fails and leaves
+# errno set, kwsys reports every directory listing over ~48 entries as an
+# error, and file(GLOB) silently returns nothing. The glob probe below exists
+# to name that failure instead of letting it surface as an unidentifiable
+# compiler.
+
+name: OHOS native build
+
+on:
+  push:
+    branches:
+      - ohos-native-ci
+  workflow_dispatch:
+
+concurrency:
+  group: ohos-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ohos-qt-builder
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  image:
+    name: toolchain image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/ohos
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Inline cache rather than type=gha: the image is ~4 GB, which does not
+      # sit well in the 10 GB per-repository Actions cache.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .github/ohos
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
+          cache-to: type=inline
+
+  build:
+    name: qtbase
+    needs: image
+    runs-on: ubuntu-24.04-arm
+    # Hosted runners hard-stop at 6 hours.
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: source
+
+      # The image alone is ~4 GB and the runner has ~14 GB free.
+      - name: reclaim disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: pull toolchain image
+        run: docker pull "$IMAGE:$GITHUB_SHA"
+
+      - name: host kernel
+        run: |
+          uname -a
+          grep ANON_VMA_NAME "/boot/config-$(uname -r)" \
+            || echo "CONFIG_ANON_VMA_NAME absent from the kernel config; expect the glob probe to fail"
+          # Decides whether booting a real OpenHarmony system image here is
+          # even an option: without KVM, TCG is too slow to boot one.
+          ls -la /dev/kvm || echo "/dev/kvm absent: no hardware acceleration on this runner"
+          nproc; free -h
+
+      - name: print versions
+        run: |
+          docker run --rm "$IMAGE:$GITHUB_SHA" sh -c '
+            cmake --version | head -1
+            echo Ninja $(ninja --version)
+            python3 --version
+            "$CC" --version | head -1
+            printenv | sort'
+
+      # HOME and TMPDIR need somewhere writable: the uid we pass has no passwd
+      # entry and the container's own /tmp is not writable by it.
+      - name: prepare work tree
+        run: mkdir -p build scratch qtinstall
+
+      - name: cmake file(GLOB) probe
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/scratch -e TMPDIR=/scratch \
+            -v "$PWD/source:/src:ro" \
+            -v "$PWD/scratch:/scratch" \
+            "$IMAGE:$GITHUB_SHA" \
+            cmake -DWORKDIR=/scratch -P /src/.github/ohos/globtest.cmake
+
+      - name: configure
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/scratch -e TMPDIR=/scratch \
+            -v "$PWD/source:/src:ro" \
+            -v "$PWD/build:/build" \
+            -v "$PWD/scratch:/scratch" \
+            -w /build \
+            "$IMAGE:$GITHUB_SHA" \
+            cmake -S /src -B /build -G Ninja \
+              -DOHOS=ON \
+              -DCMAKE_INSTALL_PREFIX=/qtinstall \
+              -DCMAKE_C_FLAGS=-DOHOS_PLATFORM=OHOS \
+              -DCMAKE_CXX_FLAGS=-DOHOS_PLATFORM=OHOS \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DQT_BUILD_EXAMPLES=OFF \
+              -DQT_BUILD_TESTS=OFF
+
+      - name: build
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/scratch -e TMPDIR=/scratch \
+            -e OHOS_SHIM_TRACE=1 \
+            -v "$PWD/source:/src:ro" \
+            -v "$PWD/build:/build" \
+            -v "$PWD/scratch:/scratch" \
+            -w /build \
+            "$IMAGE:$GITHUB_SHA" \
+            cmake --build /build --parallel
+
+      # qtbase proves QCoreApplication-based tools run. The tools in other
+      # modules (qsb, qmlimportscanner, qmltyperegistrar, qmlcachegen) are the
+      # real question: they link shared Qt and do substantial work at build
+      # time. Build the modules that host them and find out.
+      - name: install qtbase
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/scratch -e TMPDIR=/scratch \
+            -v "$PWD/source:/src:ro" \
+            -v "$PWD/build:/build" \
+            -v "$PWD/scratch:/scratch" \
+            -v "$PWD/qtinstall:/qtinstall" \
+            "$IMAGE:$GITHUB_SHA" \
+            cmake --install /build
+          echo "qtbase tools installed:"; find qtinstall/libexec qtinstall/bin -maxdepth 1 -type f -printf "%f\n" | sort | head -30
+
+      - name: clone modules
+        run: |
+          for m in qtshadertools qtdeclarative; do
+            git clone --quiet --depth 1 -b dev "https://code.qt.io/qt/$m.git" "$m"
+            echo "$m at $(git -C "$m" rev-parse --short HEAD)"
+          done
+
+      - name: build qtshadertools
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/ws/scratch -e TMPDIR=/ws/scratch \
+            -v "$PWD:/ws" -v "$PWD/qtinstall:/qtinstall" -w /ws \
+            "$IMAGE:$GITHUB_SHA" \
+            sh -c 'cmake -S /ws/qtshadertools -B /ws/build-qtshadertools -G Ninja \
+                     -DCMAKE_PREFIX_PATH=/qtinstall \
+                     -DCMAKE_BUILD_TYPE=Release \
+                     -DCMAKE_C_FLAGS=-DOHOS_PLATFORM=OHOS \
+                     -DCMAKE_CXX_FLAGS=-DOHOS_PLATFORM=OHOS \
+                   && cmake --build /ws/build-qtshadertools --parallel'
+
+      - name: build qtdeclarative
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/ws/scratch -e TMPDIR=/ws/scratch \
+            -v "$PWD:/ws" -v "$PWD/qtinstall:/qtinstall" -w /ws \
+            "$IMAGE:$GITHUB_SHA" \
+            sh -c 'cmake -S /ws/qtdeclarative -B /ws/build-qtdeclarative -G Ninja \
+                     -DCMAKE_PREFIX_PATH="/qtinstall;/ws/build-qtshadertools" \
+                     -DCMAKE_BUILD_TYPE=Release \
+                     -DCMAKE_C_FLAGS=-DOHOS_PLATFORM=OHOS \
+                     -DCMAKE_CXX_FLAGS=-DOHOS_PLATFORM=OHOS \
+                     -DQT_BUILD_EXAMPLES=OFF -DQT_BUILD_TESTS=OFF \
+                   && cmake --build /ws/build-qtdeclarative --parallel'
+
+      - name: diagnose a crashing build tool
+        if: failure()
+        run: |
+          [ -x build/libexec/qvkgen ] || { echo "qvkgen was not built; nothing to diagnose"; exit 0; }
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e HOME=/scratch -e TMPDIR=/scratch -e OHOS_SHIM_TRACE=1 \
+            -v "$PWD/source:/src:ro" \
+            -v "$PWD/build:/build" \
+            -v "$PWD/scratch:/scratch" \
+            -w /scratch \
+            "$IMAGE:$GITHUB_SHA" \
+            sh -c '
+              echo "=== qvkgen with no arguments (does it even start?) ==="
+              /build/libexec/qvkgen; echo "exit: $?"
+              echo
+              echo "=== backtrace under lldb ==="
+              lldb -b -o run -o "bt all" -o quit -- \
+                /build/libexec/qvkgen \
+                /src/src/gui/vulkan/vk.xml \
+                /src/src/gui/vulkan/licenseheader.h.in \
+                /scratch/qvkout 2>&1 | tail -60
+            '
+
+      - name: disk usage
+        if: always()
+        run: df -h /
+
+      - name: logs on failure
+        if: failure()
+        run: |
+          for f in build/CMakeFiles/CMakeConfigureLog.yaml \
+                   build/CMakeFiles/CMakeOutput.log \
+                   build/CMakeFiles/CMakeError.log \
+                   build/CMakeCache.txt; do
+            echo "==== $f ===="
+            cat "$f" 2>/dev/null || echo "(absent)"
+          done
