@@ -167,10 +167,11 @@ jobs:
             "$IMAGE:$GITHUB_SHA" \
             cmake --build /build --parallel
 
-      # qtbase proves QCoreApplication-based tools run. The tools in other
-      # modules (qsb, qmlimportscanner, qmltyperegistrar, qmlcachegen) are the
-      # real question: they link shared Qt and do substantial work at build
-      # time. Build the modules that host them and find out.
+      # qtbase proves QCoreApplication-based tools run. qtshadertools and
+      # qtdeclarative prove the harder case: qsb, qmlimportscanner,
+      # qmltyperegistrar and qmlcachegen link shared Qt and do substantial
+      # work at build time. All three modules install into one prefix, so
+      # what comes out is a usable Qt rather than three build trees.
       - name: install qtbase
         run: |
           docker run --rm \
@@ -203,7 +204,9 @@ jobs:
                      -DCMAKE_BUILD_TYPE=Release \
                      -DCMAKE_C_FLAGS=-DOHOS_PLATFORM=OHOS \
                      -DCMAKE_CXX_FLAGS=-DOHOS_PLATFORM=OHOS \
-                   && cmake --build /ws/build-qtshadertools --parallel'
+                     -DCMAKE_INSTALL_PREFIX=/qtinstall \
+                   && cmake --build /ws/build-qtshadertools --parallel \
+                   && cmake --install /ws/build-qtshadertools'
 
       - name: build qtdeclarative
         run: |
@@ -218,7 +221,38 @@ jobs:
                      -DCMAKE_C_FLAGS=-DOHOS_PLATFORM=OHOS \
                      -DCMAKE_CXX_FLAGS=-DOHOS_PLATFORM=OHOS \
                      -DQT_BUILD_EXAMPLES=OFF -DQT_BUILD_TESTS=OFF \
-                   && cmake --build /ws/build-qtdeclarative --parallel'
+                     -DCMAKE_INSTALL_PREFIX=/qtinstall \
+                   && cmake --build /ws/build-qtdeclarative --parallel \
+                   && cmake --install /ws/build-qtdeclarative'
+
+      # Everything the three modules installed, in one prefix: the Qt
+      # libraries, the plugins, the QML modules and the build-time tools,
+      # all native OpenHarmony arm64 binaries. Without this the whole build
+      # is discarded when the job ends and only the pass/fail result remains.
+      - name: what was produced
+        run: |
+          du -sh qtinstall
+          echo "--- top-level ---"
+          ls -1 qtinstall
+          echo "--- tools in libexec and bin ---"
+          find qtinstall/libexec qtinstall/bin -maxdepth 1 -type f -printf "%f\n" | sort
+          echo "--- shared libraries ---"
+          find qtinstall/lib -maxdepth 1 -name "libQt6*.so.*" -printf "%f\t%s\n" | sort
+
+      # tar first: the tree has many small files and symlinks, and
+      # upload-artifact neither preserves symlinks nor likes file counts in
+      # the tens of thousands.
+      - name: pack the install tree
+        run: tar -czf qt-ohos-arm64.tar.gz -C qtinstall .
+
+      - name: upload Qt for OpenHarmony
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-ohos-arm64-${{ github.sha }}
+          path: qt-ohos-arm64.tar.gz
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: diagnose a crashing build tool
         if: failure()
