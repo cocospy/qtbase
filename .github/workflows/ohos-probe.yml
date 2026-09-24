@@ -16,8 +16,15 @@
 
 name: OHOS probe
 
+# workflow_dispatch alone is not enough: GitHub only offers the Run button for
+# workflows that exist on the repository's default branch. Pushing a branch
+# named ohos-probe is the trigger instead. The build workflow keys off
+# ohos-native-ci, so it does not fire there.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - ohos-probe
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/ohos-qt-builder
