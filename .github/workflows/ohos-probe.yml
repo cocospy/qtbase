@@ -1,0 +1,95 @@
+# Answers one question: can Qt's native HarmonyOS auto-detect ever fire?
+#
+# QtAutoDetectHelpers.cmake gates it on CMAKE_HOST_SYSTEM_NAME STREQUAL
+# "HarmonyOS". The main build cannot answer this. It passes -DOHOS=ON, and the
+# condition starts with NOT DEFINED OHOS, so the branch is unreachable there
+# whatever the host name is.
+#
+# Two outcomes:
+#   Linux       the condition is dead code on this cmake. If a device reports
+#               the same, it is dead code everywhere, not only in containers.
+#   HarmonyOS   the condition works, and the container failure needs a
+#               different explanation.
+#
+# This covers the container only. Run the same hostprobe.cmake on a real
+# HarmonyOS device to complete the answer.
+
+name: OHOS probe
+
+on:
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ohos-qt-builder
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    name: cmake host detection
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: source
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # :latest is what the last successful build pushed, so this job needs no
+      # image build of its own and starts in under a minute.
+      - name: pull toolchain image
+        run: docker pull "$IMAGE:latest"
+
+      - name: prepare work tree
+        run: mkdir -p scratch probe-build
+
+      - name: what cmake reports
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/scratch -e TMPDIR=/scratch \
+            -v "$PWD/source:/src:ro" \
+            -v "$PWD/scratch:/scratch" \
+            "$IMAGE:latest" \
+            cmake -P /src/.github/ohos/hostprobe.cmake
+
+      # The end-to-end check: configure qtbase WITHOUT -DOHOS=ON and see
+      # whether Qt turns OHOS on by itself. The configure is expected to fail
+      # later; only the detection message matters, so the failure is ignored.
+      - name: does Qt auto-detect fire
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/scratch -e TMPDIR=/scratch \
+            -v "$PWD/source:/src:ro" \
+            -v "$PWD/probe-build:/build" \
+            -v "$PWD/scratch:/scratch" \
+            "$IMAGE:latest" \
+            cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            > probe-configure.log 2>&1 || true
+          if grep -qF "Native HarmonyOS build detected" probe-configure.log; then
+            echo "RESULT: auto-detect FIRED"
+          else
+            echo "RESULT: auto-detect did NOT fire"
+          fi
+          echo
+          echo "=== first 40 lines of the configure log ==="
+          head -40 probe-configure.log
+
+      - name: upload configure log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-configure-log
+          path: probe-configure.log
+          if-no-files-found: ignore
